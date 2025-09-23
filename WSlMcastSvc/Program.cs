@@ -1,134 +1,174 @@
 ﻿using System;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
-
-// AF_VSOCK - since .Net doesn't ship with official vsock bindings?
-
+// .NET doesn't expose AF_VSOCK directly.
 public enum VsockAddressFamily : ushort
 {
     AF_VSOCK = 40
 }
 
-public struct SockAddrVsock
+public static class Vsock
 {
-    public ushort Family;   // AF_VSOCK
-    public uint Cid;        // CID (context id - for VSOCK)
-    public uint Port;       // Port number
+    public const uint CID_ANY  = 0xFFFFFFFF; // wildcard listen
+    public const uint CID_HOST = 2;          // host (Windows) CID
 }
 
-public class VsockEndPoint : EndPoint
+// Raw sockaddr_vm is 16 bytes on Windows/Linux for AF_VSOCK.
+public sealed class VsockEndPoint : EndPoint
 {
-    public uint Cid { get; }
+    public uint Cid  { get; }
     public uint Port { get; }
 
-    public VsockEndPoint(uint Cid, uint port)
+    public VsockEndPoint(uint cid, uint port)
     {
-        this.Cid = Cid;
-        this.Port = port;
+        Cid = cid;
+        Port = port;
     }
 
     public override AddressFamily AddressFamily => (AddressFamily)VsockAddressFamily.AF_VSOCK;
 
     public override SocketAddress Serialize()
     {
-        var socket_addr = new SocketAddress(AddressFamily, 16); // 16 byte sockaddr
+        // sockaddr_vm (16 bytes):
+        // 0..1  : family (AF_VSOCK)
+        // 2..3  : reserved (0)
+        // 4..7  : CID
+        // 8..11 : Port
+        // 12..15: reserved (0)
+        var sa = new SocketAddress(AddressFamily, 16);
 
         ushort fam = (ushort)AddressFamily;
+        sa[0] = (byte)(fam & 0xFF);      // low byte
+        sa[1] = (byte)((fam >> 8) & 0xFF); // high byte
 
-        socket_addr[0] = (byte)fam; //  low byte - (x86)
-        socket_addr[1] = (byte)(fam >> 8); // high byte portion
-
-
-
-
-        byte[] cidBytes = BitConverter.GetBytes(Cid);
-        for (int i = 0; i < cidBytes.Length; i++)
-        {
-            socket_addr[4 + i] = cidBytes[i];
-        }
-
+        byte[] cidBytes  = BitConverter.GetBytes(Cid);
         byte[] portBytes = BitConverter.GetBytes(Port);
-        for (int i = 0; i < portBytes.Length; i++)
+        if (!BitConverter.IsLittleEndian)
         {
-            socket_addr[8 + i] = portBytes[i];
+            Array.Reverse(cidBytes);
+            Array.Reverse(portBytes);
         }
+        for (int i = 0; i < 4; i++) sa[4 + i]  = cidBytes[i];
+        for (int i = 0; i < 4; i++) sa[8 + i]  = portBytes[i];
+        // bytes 2-3 and 12-15 remain zero
 
-        return socket_addr;
-
+        return sa;
     }
-}
 
-public static class Vsock
-{
-    public const uint CID_ANY = 0xFFFFFFFF; // wildcard
-    public const uint CID_HOST = 2; // host CID
-}
+    public override EndPoint Create(SocketAddress socketAddress)
+    {
+        if (socketAddress.Family != AddressFamily || socketAddress.Size < 16)
+            throw new ArgumentException("Invalid VSOCK socket address.");
 
+       // sockaddr_vm (16 bytes):
+        // 0..1  : family (AF_VSOCK)
+        // 2..3  : reserved (0)
+        // 4..7  : CID
+        // 8..11 : Port
+        // 12..15: reserved (0)
+        byte[] cidBytes  = new byte[4];
+        byte[] portBytes = new byte[4];
+        for (int i = 0; i < 4; i++) cidBytes[i]  = socketAddress[4 + i];
+        for (int i = 0; i < 4; i++) portBytes[i] = socketAddress[8 + i];
+        if (!BitConverter.IsLittleEndian)
+        {
+            Array.Reverse(cidBytes);
+            Array.Reverse(portBytes);
+        }
+        uint cid  = BitConverter.ToUInt32(cidBytes, 0);
+        uint port = BitConverter.ToUInt32(portBytes, 0);
+
+        return new VsockEndPoint(cid, port);
+    }
+
+    public override string ToString() => $"vsock:{Cid}:{Port}";
+}
 
 class WslMcastSvc
 {
-    const int VSOCK_PORT = 12345;
-    const int UDP_PORT = 5000;
-    const string MCAST_GROUP = "224.1.1.1";
-
-    const int BUFFER_SIZE = 2048;
+    const int VSOCK_PORT   = 12345;            // vsock svc port 
+    const int UDP_PORT     = 5000;             // multicast UDP port used 
+    const string MCAST_GRP = "224.1.1.1";      // group choosen for testing
+    const int BUFFER_SIZE  = 2048;
 
     static void Main(string[] args)
     {
-        Console.WriteLine("Starting Windows Multicast Svc...");
+        Console.CancelKeyPress += (s, e) => { e.Cancel = true; _cts.Cancel(); };
+        AppDomain.CurrentDomain.ProcessExit += (s, e) => _cts.Cancel();
 
-        // 1. Open vsock listener
-        var vsock = new Socket((AddressFamily)VsockAddressFamily.AF_VSOCK,
-                               SocketType.Stream,
-                               ProtocolType.Unspecified);
-        vsock.Bind(new VsockEndPoint(Vsock.CID_ANY, VSOCK_PORT));
-        vsock.Listen(1);
+        Console.WriteLine("Starting WslMcastSvc...");
+
+        // vsock listener
+        using var vsockListen = new Socket((AddressFamily)VsockAddressFamily.AF_VSOCK,
+                                           SocketType.Stream,
+                                           ProtocolType.Unspecified);
+
+        vsockListen.Bind(new VsockEndPoint(Vsock.CID_ANY, (uint)VSOCK_PORT));
+        vsockListen.Listen(1);
 
         Console.WriteLine($"Waiting for vsock connection on port {VSOCK_PORT}...");
-        var conn = vsock.Accept();
-        Console.WriteLine("Connected to WSL kernel module.");
+        using var vsockConn = vsockListen.Accept();
+        Console.WriteLine("Connected to WSL peer.");
 
-        // 2. Open UDP multicast socket
-        var udp = new UdpClient(UDP_PORT);
-        udp.JoinMulticastGroup(IPAddress.Parse(MCAST_GROUP));
-        Console.WriteLine($"Successfully joined multicast group {MCAST_GROUP} on port {UDP_PORT}");
+        // 2) UDP multicast socket (join group)
+        using var udp = new UdpClient(UDP_PORT);
+        udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        udp.JoinMulticastGroup(IPAddress.Parse(MCAST_GRP));
 
-        var cancel = new CancellationTokenSource();
+        Console.WriteLine($"Joined multicast group {MCAST_GRP}:{UDP_PORT}");
 
-        // 3. WSL → LAN
-        Task.Run(() =>
+        // Kick off two way tasks
+        var t1 = Task.Run(() => VsockToLan(vsockConn, udp, _cts.Token));
+        var t2 = Task.Run(() => LanToVsock(udp, vsockConn, _cts.Token));
+
+        Console.WriteLine("Press Ctrl+C to stop...");
+        try { Task.WaitAll(new[] { t1, t2 }); } catch (AggregateException) { /* ignore on cancel */ }
+        Console.WriteLine("Shutting down.");
+    }
+
+    static readonly CancellationTokenSource _cts = new CancellationTokenSource();
+
+    static async Task VsockToLan(Socket vsockConn, UdpClient udp, CancellationToken ct)
+    {
+        var buf = new byte[BUFFER_SIZE];
+        var mcastEndPoint = new IPEndPoint(IPAddress.Parse(MCAST_GRP), UDP_PORT);
+
+        while (!ct.IsCancellationRequested)
         {
-            var buf = new byte[BUFFER_SIZE];
-            while (!cancel.Token.IsCancellationRequested)
-            {
-                int len = conn.Receive(buf);
-                if (len > 0)
-                {
-                    udp.Send(buf, len, new IPEndPoint(IPAddress.Parse(MCAST_GROUP), UDP_PORT));
-                    Console.WriteLine($"Forwarded {len} bytes from WSL → LAN");
-                }
-            }
-        }, cancel.Token);
+            int n;
+            try { n = await vsockConn.ReceiveAsync(buf, SocketFlags.None, ct); }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex) { Console.WriteLine($"WSL→LAN recv error: {ex.Message}"); break; }
 
-        // 4. LAN → WSL
-        Task.Run(() =>
+            if (n > 0)
+            {
+                try { await udp.SendAsync(new ReadOnlyMemory<byte>(buf, 0, n), mcastEndPoint, ct); }
+                catch (Exception ex) { Console.WriteLine($"WSL→LAN send error: {ex.Message}"); break; }
+                // Console.WriteLine($"WSL → LAN {n} bytes");
+            }
+        }
+    }
+
+    static async Task LanToVsock(UdpClient udp, Socket vsockConn, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
         {
-            IPEndPoint remoteEP = null;
-            while (!cancel.Token.IsCancellationRequested)
-            {
-                byte[] data = udp.Receive(ref remoteEP);
-                if (data.Length > 0)
-                {
-                    conn.Send(data);
-                    Console.WriteLine($"Forwarded {data.Length} bytes from LAN → WSL");
-                }
-            }
-        }, cancel.Token);
+            UdpReceiveResult res;
+            try { res = await udp.ReceiveAsync(ct); }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex) { Console.WriteLine($"LAN→WSL recv error: {ex.Message}"); break; }
 
-        Console.WriteLine("Press Ctrl+C to exit.");
-        Thread.Sleep(Timeout.Infinite);
+            var data = res.Buffer;
+            if (data != null && data.Length > 0)
+            {
+                try { await vsockConn.SendAsync(data, SocketFlags.None, ct); }
+                catch (Exception ex) { Console.WriteLine($"LAN→WSL send error: {ex.Message}"); break; }
+                Console.WriteLine($"LAN → WSL {data.Length} bytes");
+            }
+        }
     }
 }

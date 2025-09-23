@@ -1,6 +1,6 @@
 # Experimental WSL Multicast Adapter
 
-Experimental support for Multicast - both outbound & inbound via a virtual Linux adapter & Windows proxy service
+Experimental support for Multicast on WSL for outbound & inbound traffic - both outbound & inbound via a virtual Linux adapter & Windows proxy service
 
 ---
 

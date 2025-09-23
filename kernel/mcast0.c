@@ -1,9 +1,13 @@
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
+#include <linux/printk.h>
+#include <linux/etherdevice.h>
 
 static struct net_device *mcast0_dev;
 
+
+// Testing 
 static int mcast0_open(struct net_device *dev)
 {
     netif_start_queue(dev);
@@ -20,8 +24,9 @@ static int mcast0_stop(struct net_device *dev)
 
 static netdev_tx_t mcast0_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-    pr_info("mcast0: outbound packet len=%u\n", skb->len);
-    dev_kfree_skb(skb);  // drop packets for now
+    pr_info("mcast0: got packet, len=%u\n", skb->len);
+
+    dev_kfree_skb(skb);
     return NETDEV_TX_OK;
 }
 
@@ -33,11 +38,13 @@ static const struct net_device_ops mcast0_ops = {
 
 static void mcast0_setup(struct net_device *dev)
 {
+    ether_setup(dev);  // default stuff
     dev->netdev_ops = &mcast0_ops;
+
     dev->flags |= IFF_NOARP;
     dev->features |= NETIF_F_HW_CSUM;
+    eth_hw_addr_random(dev);  // random MAC..
 }
-
 static int __init mcast0_init(void)
 {
     mcast0_dev = alloc_netdev(0, "mcast0", NET_NAME_UNKNOWN, mcast0_setup);

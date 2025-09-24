@@ -124,19 +124,10 @@ static int __init mcast0_init(void)
     __be32 addr = 0;
     int rc;
 
-    /* Parse host IPv4 string to network-order __be32 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
     if (!in4_pton(host, -1, (u8 *)&addr, -1, NULL)) {
-        pr_err(DRV_NAME ": invalid host IPv4 '%s'\n", host);
-        return -EINVAL;
-    }
-#else
-    addr = in_aton(host);
-    if (!addr) {
-        pr_err(DRV_NAME ": invalid host IPv4 '%s'\n", host);
-        return -EINVAL;
-    }
-#endif
+            pr_err(DRV_NAME ": invalid host IPv4 '%s'\n", host);
+            return -EINVAL;
+        }
 
     mcast0_dev = alloc_netdev(0, "mcast0", NET_NAME_UNKNOWN, mcast0_setup);
     if (!mcast0_dev)

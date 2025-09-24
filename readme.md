@@ -18,6 +18,13 @@ This projects is an experimentation around attempting to restore multicast suppo
 
 ---
 
+
+## History & Changelog
+
+- Attempted to match GUIDs between vsocks & hvsocks which didn't seem to work
+- named pipes / tcp sound like viable alternatives, both with pros& cons.
+
+---
 ## Features (planned)
 TBD
 

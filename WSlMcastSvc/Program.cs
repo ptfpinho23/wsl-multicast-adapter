@@ -2,23 +2,18 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
-using System.Threading;
-using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
-// Hyper-V sockets on Windows
-public enum HvAddressFamily : int
-{
-    AF_HYPERV = 34
-}
+// Hyper-V AF_HYPERV
+public enum HvAddressFamily : int { AF_HYPERV = 34 }
 
 [StructLayout(LayoutKind.Sequential)]
 public struct SOCKADDR_HV
 {
     public ushort Family;     // AF_HYPERV
     public ushort Reserved;   // must be 0
-    public Guid VmId;         // VM target (GUID_NULL = host)
-    public Guid ServiceId;    // service ID (like port# in vsock)
+    public Guid VmId;         // target VM (Guid.Empty == host)
+    public Guid ServiceId;    // GUID derived from VSOCK port
 }
 
 public sealed class HvEndPoint : EndPoint
@@ -36,41 +31,32 @@ public sealed class HvEndPoint : EndPoint
 
     public override SocketAddress Serialize()
     {
-        // SOCKADDR_HV = 36 bytes: ushort + ushort + GUID + GUID
         var sa = new SocketAddress(AddressFamily, 36);
 
         ushort fam = (ushort)AddressFamily;
-
-        // little endian
         sa[0] = (byte)(fam & 0xFF);
         sa[1] = (byte)((fam >> 8) & 0xFF);
 
-        // reserved 
-        sa[2] = 0;
+        sa[2] = 0; // reserved
         sa[3] = 0;
 
-        byte[] vm = VmId.ToByteArray();
-        byte[] svc = ServiceId.ToByteArray();
-
-        // copy vmId
+        var vm = VmId.ToByteArray();
+        var svc = ServiceId.ToByteArray();
         for (int i = 0; i < 16; i++) sa[4 + i] = vm[i];
-
-        // copy serviceId
         for (int i = 0; i < 16; i++) sa[20 + i] = svc[i];
 
         return sa;
     }
 
-    public override EndPoint Create(SocketAddress socketAddress)
+    public override EndPoint Create(SocketAddress sa)
     {
-        if (socketAddress.Family != AddressFamily || socketAddress.Size < 36)
+        if (sa.Family != AddressFamily || sa.Size < 36)
             throw new ArgumentException("Invalid Hyper-V socket address.");
 
-        byte[] vm = new byte[16];
-        byte[] svc = new byte[16];
-        for (int i = 0; i < 16; i++) vm[i]  = socketAddress[4 + i];
-        for (int i = 0; i < 16; i++) svc[i] = socketAddress[20 + i];
-
+        var vm = new byte[16];
+        var svc = new byte[16];
+        for (int i = 0; i < 16; i++) vm[i] = sa[4 + i];
+        for (int i = 0; i < 16; i++) svc[i] = sa[20 + i];
         return new HvEndPoint(new Guid(vm), new Guid(svc));
     }
 
@@ -79,19 +65,9 @@ public sealed class HvEndPoint : EndPoint
 
 class WslMcastSvc
 {
-    static readonly CancellationTokenSource _cts = new();
+    const int BUFFER_SIZE = 2048;
 
-    // GUID service id - for testing
-    static readonly Guid SERVICE_ID = Guid.Parse("11111111-2222-3333-4444-555555555555");
-
-    const int UDP_PORT     = 5000;
-    const string MCAST_GRP = "224.1.1.1";
-    const int BUFFER_SIZE  = 2048;
-
-    // P/Invoke to Winsock
-    [DllImport("Ws2_32.dll", SetLastError = true)]
-    private static extern IntPtr socket(int af, int type, int protocol);
-
+    // WSAStartup / WSACleanup interop
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
     private struct WSAData
     {
@@ -112,92 +88,64 @@ class WslMcastSvc
     [DllImport("Ws2_32.dll", SetLastError = true)]
     private static extern int WSACleanup();
 
-    static void Main(string[] args)
-    {
-        Console.CancelKeyPress += (s, e) => { e.Cancel = true; _cts.Cancel(); };
-        AppDomain.CurrentDomain.ProcessExit += (s, e) => _cts.Cancel();
+    [DllImport("Ws2_32.dll", SetLastError = true)]
+    private static extern IntPtr socket(int af, int type, int protocol);
 
-        Console.WriteLine("Starting Hyper-V multicast bridge...");
+    static Guid GuidForPort(ushort port)
+    {
+        // Replace Data1 with port (hex, 8 digits)
+        string hex = port.ToString("x8");
+        return Guid.Parse($"{hex}-facb-11e6-bd58-64006a7986d3");
+    }
+
+    static void Main()
+    {
+        const ushort PORT = 5000; // must match Linux svm_port
+        var serviceId = GuidForPort(PORT);
+        Console.WriteLine($"Service GUID for port {PORT}: {serviceId}");
 
         // Initialize Winsock (request version 2.2)
         WSAData d;
-        int res = WSAStartup(0x202, out d); // high byte - major; low byte - minor
+        int res = WSAStartup(0x202, out d);
         if (res != 0)
             throw new SocketException(res);
 
         try
         {
-            // Create native AF_HYPERV socket via Winsock and wrap it in a SafeSocketHandle - FIXME
+            // Create AF_HYPERV socket
             IntPtr raw = socket((int)HvAddressFamily.AF_HYPERV, (int)SocketType.Stream, 1);
             if (raw == IntPtr.Zero || raw.ToInt64() == -1)
                 throw new SocketException(Marshal.GetLastWin32Error());
 
-            using var hvListen = new Socket(new SafeSocketHandle(raw, ownsHandle: true));
+            using var listen = new Socket(new SafeSocketHandle(raw, ownsHandle: true));
 
-            // Bind/listen using HvEndPoint (GUID_NULL == host)
-            hvListen.Bind(new HvEndPoint(Guid.Empty, SERVICE_ID));
-            hvListen.Listen(1);
+            // Bind on host (VmId = Guid.Empty) and Service GUID
+            listen.Bind(new HvEndPoint(Guid.Empty, serviceId));
+            listen.Listen(1);
 
-            Console.WriteLine($"Waiting for Hyper-V connection (service {SERVICE_ID})...");
-            using var hvConn = hvListen.Accept();
-            Console.WriteLine("Connected to WSL peer via Hyper-V socket.");
+            Console.WriteLine("Waiting for WSL connection...");
+            using var conn = listen.Accept();
+            Console.WriteLine("Connected.");
 
-            // UDP multicast
-            using var udp = new UdpClient(UDP_PORT);
-            udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            udp.JoinMulticastGroup(IPAddress.Parse(MCAST_GRP));
+            var buf = new byte[BUFFER_SIZE];
+            while (true)
+            {
+                int n = conn.Receive(buf);
+                if (n <= 0) break;
 
-            Console.WriteLine($"Joined multicast group {MCAST_GRP}:{UDP_PORT}");
+                if (n >= 2)
+                {
+                    ushort framelen = BitConverter.ToUInt16(buf, 0);
+                    Console.WriteLine($"Got frame {framelen} bytes");
 
-            var t1 = Task.Run(() => HvToLan(hvConn, udp, _cts.Token));
-            var t2 = Task.Run(() => LanToHv(udp, hvConn, _cts.Token));
-
-            Console.WriteLine("Press Ctrl+C to stop...");
-            try { Task.WaitAll(new[] { t1, t2 }); } catch (AggregateException) { }
-            Console.WriteLine("Shutting down.");
+                    // optional echo back
+                    conn.Send(buf, 0, 2 + framelen, SocketFlags.None);
+                }
+            }
         }
         finally
         {
             WSACleanup();
-        }
-    }
-
-    static async Task HvToLan(Socket hvConn, UdpClient udp, CancellationToken ct)
-    {
-        var buf = new byte[BUFFER_SIZE];
-        var mcastEndPoint = new IPEndPoint(IPAddress.Parse(MCAST_GRP), UDP_PORT);
-
-        while (!ct.IsCancellationRequested)
-        {
-            int n;
-            try { n = await hvConn.ReceiveAsync(buf, SocketFlags.None, ct); }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex) { Console.WriteLine($"WSL→LAN recv error: {ex.Message}"); break; }
-
-            if (n > 0)
-            {
-                try { await udp.SendAsync(new ReadOnlyMemory<byte>(buf, 0, n), mcastEndPoint, ct); }
-                catch (Exception ex) { Console.WriteLine($"WSL→LAN send error: {ex.Message}"); break; }
-            }
-        }
-    }
-
-    static async Task LanToHv(UdpClient udp, Socket hvConn, CancellationToken ct)
-    {
-        while (!ct.IsCancellationRequested)
-        {
-            UdpReceiveResult res;
-            try { res = await udp.ReceiveAsync(ct); }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex) { Console.WriteLine($"LAN -> WSL recv error: {ex.Message}"); break; }
-
-            var data = res.Buffer;
-            if (data != null && data.Length > 0)
-            {
-                try { await hvConn.SendAsync(data, SocketFlags.None, ct); }
-                catch (Exception ex) { Console.WriteLine($"LAN -> WSL send error: {ex.Message}"); break; }
-                Console.WriteLine($"LAN -> WSL {data.Length} bytes");
-            }
         }
     }
 }

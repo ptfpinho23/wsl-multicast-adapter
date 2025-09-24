@@ -10,7 +10,10 @@
 
 #define DRV_NAME "mcast0_kernsock"
 
-// Must match on win side  
+
+// Must match Windows service GUID registration
+// Registry GUID = {<port-hex>-facb-11e6-bd58-64006a7986d3}
+// See: https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/make-integration-service
 #define WIN_VSOCK_PORT 5000
 
 // in vsock the host (on windows) always has cid 2 

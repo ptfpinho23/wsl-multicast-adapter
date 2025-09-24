@@ -120,7 +120,7 @@ static int rxfn(void *arg)
                     skb->ip_summed = CHECKSUM_NONE;
 
                     // deliver packet directly onto the kernel stack
-                    netif_rx_ni(skb);
+                    netif_rx(skb);
                 }
             }
         }

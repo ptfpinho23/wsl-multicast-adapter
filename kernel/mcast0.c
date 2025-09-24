@@ -82,7 +82,7 @@ static int rxfn(void *arg)
 {
     struct msghdr msg = {0};
     struct kvec iov;
-    char buf[2048];
+    char buf[1500];
 
     allow_signal(SIGKILL);
 
